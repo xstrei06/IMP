@@ -15,6 +15,8 @@
 
 #define DISPLAY_UPDATE_INTERVAL_MS 1000
 
+SSD1306_t dev;
+
 int currentPage = 0;
 float wheelCircumference = 2.145f; // in meters
 int roundCount = 0; 
@@ -22,84 +24,106 @@ int roundCount = 0;
 float currentSpeed = 0.0f;
 float avgSpeed = 0.0f;
 float distance = 0.0f;
+
 uint32_t time = 0;
+int64_t now = 0;
+uint32_t lastTime = 0;
 uint32_t round1 = 0;
 uint32_t round2 = 0;
+uint32_t pageButtonPressed = 0;
+
+bool reset = false;
+bool standBy = true;
+bool switchOff = false;
 
 void calculate_speed_distance() {
     distance = roundCount * wheelCircumference; // in meters
 
     if(time == 0){
         avgSpeed = 0;
-    }else{
-        avgSpeed = distance / (time / 1000.0); // in m/s
-    }
-    
+    }    
+
     uint32_t timeInBetween = round1 - round2; // in ms
-    if((time - round1) > 2000){
+    if((int64_t)(now - round1) >= 15000 && (int64_t)(now - pageButtonPressed) >= 15000){ //15s
+        switchOff = true;
+    }else if((now - round1) > 4000){ //4s
         currentSpeed = 0;
+        standBy = true;
     }else if(timeInBetween == 0){
         currentSpeed = currentSpeed;
     }else{
         currentSpeed = wheelCircumference / (timeInBetween / 1000.0); // in m/s
+        avgSpeed = distance / (time / 1000.0); // in m/s
     }
-    
-    printf("currentSpeed: %f\n", currentSpeed);
-    printf("avgSpeed: %f\n", avgSpeed);
 }
 
 void button_task(void *pvParameter) {
+    uint32_t buttonHold = 0;
+    bool rst = false;
+    bool buttonPressed = false;
     while(1) {
         if(gpio_get_level(BUTTON_GPIO_NEXT) == 0) {
-            currentPage = (currentPage + 1) % 3;
-            vTaskDelay(300 / portTICK_PERIOD_MS);
+            if(!rst){
+                currentPage = (currentPage + 1) % 3;
+                switchOff = false;
+                rst = true;
+                standBy = false;
+                pageButtonPressed = xTaskGetTickCount() * portTICK_PERIOD_MS;
+                vTaskDelay(500 / portTICK_PERIOD_MS);
+            }else{
+                buttonHold = xTaskGetTickCount() * portTICK_PERIOD_MS;
+                if(buttonHold - pageButtonPressed >= 3000){
+                    reset = true;
+                    standBy = true;
+                }
+            }
+        }else{
+            rst = false;
         }
 
         if(gpio_get_level(BUTTON_GPIO_WHEEL) == 0) {
-            roundCount++;
-            round2 = round1;
-            round1 = xTaskGetTickCount() * portTICK_PERIOD_MS;
-            ESP_LOGI(tag, "Wheel button pressed. roundCount: %d", roundCount);
-            calculate_speed_distance();
-            vTaskDelay(300 / portTICK_PERIOD_MS);
+            if(!buttonPressed){ 
+                buttonPressed = true;
+                roundCount++;
+                round2 = round1;
+                round1 = xTaskGetTickCount() * portTICK_PERIOD_MS;
+                standBy = false;
+                switchOff = false;
+            }
+        }else{
+            buttonPressed = false;
         }
-        vTaskDelay(10 / portTICK_PERIOD_MS);
+        vTaskDelay(50 / portTICK_PERIOD_MS);
     }
 }
 
-void display_page(SSD1306_t *dev, int page, float currentSpeed, float avgSpeed, float distance) {
-    switch (page) {
+void display_page() {
+    char display_value[16];
+    switch (currentPage) {
         case 0:
-            ssd1306_clear_screen(dev, false);
-            ssd1306_contrast(dev, 0xff);
-            ssd1306_display_text(dev, 0, "Current speed:", 14, false);
-            char speed_text[30];
-            sprintf(speed_text, " %f m/s", currentSpeed);
-            ssd1306_display_text(dev, 2, speed_text, strlen(speed_text), false);
+            ssd1306_contrast(&dev, 0xff);
+            ssd1306_display_text(&dev, 0, "Current speed:", 14, false);
+            sprintf(display_value, " %.3f m/s", currentSpeed);
             break;
         case 1:
-            ssd1306_clear_screen(dev, false);
-            ssd1306_contrast(dev, 0xff);
-            ssd1306_display_text(dev, 0, "Avg. speed:", 11, false);
-            char avg_speed_text[30];
-            sprintf(avg_speed_text, " %f m/s", avgSpeed);
-            ssd1306_display_text(dev, 2, avg_speed_text, strlen(avg_speed_text), false);
+            ssd1306_contrast(&dev, 0xff);
+            ssd1306_display_text(&dev, 0, "Avg. speed:   ", 14, false);
+            sprintf(display_value, " %.3f m/s", avgSpeed);
             break;
         case 2:
-            ssd1306_clear_screen(dev, false);
-            ssd1306_contrast(dev, 0xff);
-            ssd1306_display_text(dev, 0, "Distance:", 9, false);
-            char distance_text[30];
-            sprintf(distance_text, " %f m", distance);
-            ssd1306_display_text(dev, 2, distance_text, strlen(distance_text), false);
+            ssd1306_contrast(&dev, 0xff);
+            ssd1306_display_text(&dev, 0, "Distance:     ", 14, false);
+            sprintf(display_value, " %.3f m", distance);
             break;
     }
+    for(int i = strlen(display_value); i < 16; i++) {
+        display_value[i] = ' ';
+    }
+    ssd1306_display_text(&dev, 2, display_value, 16, false);
 }
 
 void app_main(void)
 {
-
-	SSD1306_t dev;
 
 	ESP_LOGI(tag, "INTERFACE is SPI");
 	ESP_LOGI(tag, "CONFIG_MOSI_GPIO=%d",CONFIG_MOSI_GPIO);
@@ -125,17 +149,42 @@ void app_main(void)
 	ssd1306_contrast(&dev, 0xff);
 	ssd1306_display_text_x3(&dev, 0, "Hello", 5, false);
 	vTaskDelay(3000 / portTICK_PERIOD_MS);
+    ssd1306_clear_screen(&dev, false);
 
     xTaskCreate(button_task, "button_task", 2048, NULL, 10, NULL);
 
     while(1) {
+        if(reset){
+            roundCount = 0;
+            time = 0;
+            round1 = 0;
+            round2 = 0;
+            distance = 0;
+            avgSpeed = 0;
+            currentSpeed = 0;
+            reset = false;
+        }
 
-        time = xTaskGetTickCount() * portTICK_PERIOD_MS;
+        now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+
+        if(!standBy){
+            time += now - lastTime;
+        }
+
+        lastTime = now;
 
         calculate_speed_distance();
 
-        display_page(&dev, currentPage, currentSpeed, avgSpeed, distance);
+        display_page();
 
-        vTaskDelay(500 / portTICK_PERIOD_MS);
+        if(switchOff){
+            ssd1306_clear_screen(&dev, false);
+            ssd1306_contrast(&dev, 0xff);
+            while(switchOff){
+                vTaskDelay(100 / portTICK_PERIOD_MS);
+            }
+        }
+
+        vTaskDelay(100 / portTICK_PERIOD_MS);
     }
 }
