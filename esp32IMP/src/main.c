@@ -5,10 +5,21 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_log.h"
+#include "esp_wifi.h"
+#include "esp_http_client.h"
+#include "esp_event.h"
+#include "esp_netif.h"
+#include "esp_netif_types.h"
+#include "nvs_flash.h"
+#include <time.h>
+#include "esp_sntp.h"
 
 #include "ssd1306.h"
 
 #define tag "SSD1306"
+
+#define WIFI_SSID "AndroidAPFA59"
+#define WIFI_PASSWORD "Xrda6605"
 
 #define BUTTON_GPIO_NEXT 12
 #define BUTTON_GPIO_WHEEL 13
@@ -25,7 +36,7 @@ float currentSpeed = 0.0f;
 float avgSpeed = 0.0f;
 float distance = 0.0f;
 
-uint32_t time = 0;
+uint32_t currentTime = 0;
 int64_t now = 0;
 uint32_t lastTime = 0;
 uint32_t round1 = 0;
@@ -36,16 +47,19 @@ bool reset = false;
 bool standBy = true;
 bool switchOff = false;
 
+void send_request(void);
+
 void calculate_speed_distance() {
     distance = roundCount * wheelCircumference; // in meters
 
-    if(time == 0){
+    if(currentTime == 0){
         avgSpeed = 0;
     }    
 
     uint32_t timeInBetween = round1 - round2; // in ms
     if((int64_t)(now - round1) >= 15000 && (int64_t)(now - pageButtonPressed) >= 15000){ //15s
         switchOff = true;
+        send_request();
     }else if((now - round1) > 4000){ //4s
         currentSpeed = 0;
         standBy = true;
@@ -53,7 +67,7 @@ void calculate_speed_distance() {
         currentSpeed = currentSpeed;
     }else{
         currentSpeed = wheelCircumference / (timeInBetween / 1000.0); // in m/s
-        avgSpeed = distance / (time / 1000.0); // in m/s
+        avgSpeed = distance / (currentTime / 1000.0); // in m/s
     }
 }
 
@@ -69,7 +83,7 @@ void button_task(void *pvParameter) {
                 rst = true;
                 standBy = false;
                 pageButtonPressed = xTaskGetTickCount() * portTICK_PERIOD_MS;
-                vTaskDelay(500 / portTICK_PERIOD_MS);
+                vTaskDelay(300 / portTICK_PERIOD_MS);
             }else{
                 buttonHold = xTaskGetTickCount() * portTICK_PERIOD_MS;
                 if(buttonHold - pageButtonPressed >= 3000){
@@ -93,7 +107,7 @@ void button_task(void *pvParameter) {
         }else{
             buttonPressed = false;
         }
-        vTaskDelay(50 / portTICK_PERIOD_MS);
+        vTaskDelay(20 / portTICK_PERIOD_MS);
     }
 }
 
@@ -122,18 +136,152 @@ void display_page() {
     ssd1306_display_text(&dev, 2, display_value, 16, false);
 }
 
+static void wifi_event_handler(void *event_handler_arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
+{
+    switch (event_id)
+    {
+    case WIFI_EVENT_STA_START:
+        printf("WiFi connecting... \n");
+        break;
+    case WIFI_EVENT_STA_CONNECTED:
+        printf("WiFi connected... \n");
+        break;
+    case WIFI_EVENT_STA_DISCONNECTED:
+        printf("WiFi lost connection... \n");
+        break;
+    case IP_EVENT_STA_GOT_IP:
+        printf("WiFi got IP... \n\n");
+        break;
+    default:
+        break;
+    }
+}
+
+void wifi_connection()
+{
+    esp_netif_init();
+    esp_event_loop_create_default();
+    esp_netif_create_default_wifi_sta();
+    wifi_init_config_t wifi_initiation = WIFI_INIT_CONFIG_DEFAULT();
+    esp_wifi_init(&wifi_initiation);
+
+    esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL);
+    esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL);
+    wifi_config_t wifi_configuration = {
+        .sta = {
+            .ssid = WIFI_SSID,
+            .password = WIFI_PASSWORD,
+        }   
+    };
+    esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_configuration);
+    esp_wifi_start();
+
+    while(esp_wifi_connect() != ESP_OK) {
+        printf("WiFi connecting... \n");
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+    }
+}
+
+esp_err_t client_event_post_handler(esp_http_client_event_handle_t evt)
+{
+    switch (evt->event_id)
+    {
+    case HTTP_EVENT_ON_DATA:
+        printf("HTTP_EVENT_ON_DATA: %.*s\n", evt->data_len, (char *)evt->data);
+        break;
+
+    default:
+        break;
+    }
+    return ESP_OK;
+}
+
+void init_sntp(){
+    esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_init();
+}
+
+char* getTimestamp() {
+    while(sntp_get_sync_status() == SNTP_SYNC_STATUS_RESET) {
+        vTaskDelay(1000 / portTICK_PERIOD_MS);
+    }
+    char *timestamp = malloc(64);
+    if(timestamp == NULL) {
+        ESP_LOGE(tag, "Failed to allocate memory for timestamp");
+        return NULL;
+    }
+    time_t now;
+    struct tm timeinfo;
+    time(&now);
+    setenv("TZ", "UTC-1", 1);
+    localtime_r(&now, &timeinfo);
+    strftime(timestamp, 64, "%d.%m.%Y %H:%M:%S", &timeinfo);
+    return timestamp;
+}
+
+void send_request() {
+    esp_http_client_config_t config = {
+        .url = "http://www.stud.fit.vutbr.cz/~xstrei06/IMP/index.php",
+        .method = HTTP_METHOD_POST,
+        .event_handler = client_event_post_handler,
+        .cert_pem = NULL,
+        .buffer_size = 1024,
+    };
+
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) {
+        ESP_LOGE(tag, "Failed to initialize HTTP client");
+        return;
+    }
+
+    init_sntp();
+
+    char data[128] = {0};
+    char *timestamp = getTimestamp();
+    sprintf(data, "%s, average speed: %.3f m/s, distance: %.3f m\n", timestamp, avgSpeed, distance);
+    free(timestamp);
+    esp_sntp_stop();
+    
+    esp_err_t post_field = esp_http_client_set_post_field(client, data, strlen(data));
+    if(post_field != ESP_OK){
+        ESP_LOGE(tag, "Failed to set post field: %s", esp_err_to_name(post_field));
+    }
+
+    esp_err_t header = esp_http_client_set_header(client, "Content-Type", "text/plain");
+    if(header != ESP_OK){
+        ESP_LOGE(tag, "Failed to set header: %s", esp_err_to_name(header));
+    }
+    
+    esp_err_t perform = esp_http_client_perform(client);
+    if (perform != ESP_OK) {
+        ESP_LOGE(tag, "HTTP Request failed: %s", esp_err_to_name(perform));
+        int status_code = esp_http_client_get_status_code(client);
+        ESP_LOGE(tag, "Status = %d", status_code);
+    } else {
+        ESP_LOGI(tag, "HTTP Request succeeded");
+    }
+    esp_http_client_cleanup(client);
+}
+
+
 void app_main(void)
 {
+    esp_err_t ret = nvs_flash_init();
+    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_ERROR_CHECK(nvs_flash_erase());
+        ret = nvs_flash_init();
+    }
+    ESP_ERROR_CHECK(ret);
 
-	ESP_LOGI(tag, "INTERFACE is SPI");
-	ESP_LOGI(tag, "CONFIG_MOSI_GPIO=%d",CONFIG_MOSI_GPIO);
-	ESP_LOGI(tag, "CONFIG_SCLK_GPIO=%d",CONFIG_SCLK_GPIO);
-	ESP_LOGI(tag, "CONFIG_CS_GPIO=%d",CONFIG_CS_GPIO);
-	ESP_LOGI(tag, "CONFIG_DC_GPIO=%d",CONFIG_DC_GPIO);
-	ESP_LOGI(tag, "CONFIG_RESET_GPIO=%d",CONFIG_RESET_GPIO);
-	spi_master_init(&dev, CONFIG_MOSI_GPIO, CONFIG_SCLK_GPIO, CONFIG_CS_GPIO, CONFIG_DC_GPIO, CONFIG_RESET_GPIO);
+    wifi_connection();
 
-    // Initialize buttons
+    vTaskDelay(4000 / portTICK_PERIOD_MS);
+
+    spi_master_init(&dev, CONFIG_MOSI_GPIO, CONFIG_SCLK_GPIO, CONFIG_CS_GPIO, CONFIG_DC_GPIO, CONFIG_RESET_GPIO);
+	ssd1306_init(&dev, 128, 64);
+
+    // init buttons
     gpio_config_t io_conf;
     io_conf.intr_type = GPIO_INTR_ANYEDGE;
     io_conf.pin_bit_mask = (1ULL<<BUTTON_GPIO_NEXT) | (1ULL<<BUTTON_GPIO_WHEEL);
@@ -142,33 +290,35 @@ void app_main(void)
     io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
     gpio_config(&io_conf);
 
-	ESP_LOGI(tag, "Panel is 128x64");
-	ssd1306_init(&dev, 128, 64);
-
 	ssd1306_clear_screen(&dev, false);
 	ssd1306_contrast(&dev, 0xff);
-	ssd1306_display_text_x3(&dev, 0, "Hello", 5, false);
+	ssd1306_display_text_x3(&dev, 0, "TACHO", 5, false);
+    ssd1306_display_text_x3(&dev, 3, "METER", 5, false);
 	vTaskDelay(3000 / portTICK_PERIOD_MS);
     ssd1306_clear_screen(&dev, false);
 
     xTaskCreate(button_task, "button_task", 2048, NULL, 10, NULL);
 
+    send_request();
+    vTaskDelay(500 / portTICK_PERIOD_MS);
+
     while(1) {
         if(reset){
             roundCount = 0;
-            time = 0;
+            currentTime = 0;
             round1 = 0;
             round2 = 0;
             distance = 0;
             avgSpeed = 0;
             currentSpeed = 0;
             reset = false;
+            send_request();
         }
 
         now = xTaskGetTickCount() * portTICK_PERIOD_MS;
 
         if(!standBy){
-            time += now - lastTime;
+            currentTime += now - lastTime;
         }
 
         lastTime = now;
