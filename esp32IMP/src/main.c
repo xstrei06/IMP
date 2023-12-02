@@ -11,6 +11,7 @@
 #include "esp_netif.h"
 #include "esp_netif_types.h"
 #include "nvs_flash.h"
+#include "nvs.h"
 #include <time.h>
 #include "esp_sntp.h"
 
@@ -30,18 +31,18 @@ SSD1306_t dev;
 
 int currentPage = 0;
 float wheelCircumference = 2.145f; // in meters
-int roundCount = 0; 
+int32_t roundCount = 0; 
 
 float currentSpeed = 0.0f;
 float avgSpeed = 0.0f;
 float distance = 0.0f;
 
-uint32_t currentTime = 0;
+int64_t currentTime = 0;
 int64_t now = 0;
-uint32_t lastTime = 0;
-uint32_t round1 = 0;
-uint32_t round2 = 0;
-uint32_t pageButtonPressed = 0;
+int64_t lastTime = 0;
+int64_t round1 = 0;
+int64_t round2 = 0;
+int64_t pageButtonPressed = 0;
 
 bool reset = false;
 bool standBy = true;
@@ -52,47 +53,49 @@ void send_request(void);
 void calculate_speed_distance() {
     distance = roundCount * wheelCircumference; // in meters
 
-    if(currentTime == 0){
-        avgSpeed = 0;
-    }    
+    int32_t timeInBetween = round1 - round2; // in ms
 
-    uint32_t timeInBetween = round1 - round2; // in ms
-    if((int64_t)(now - round1) >= 15000 && (int64_t)(now - pageButtonPressed) >= 15000){ //15s
-        switchOff = true;
+    if((int64_t)(now - round1) >= 15000 && (int64_t)(now - pageButtonPressed) >= 12000){ //12s
         send_request();
+        vTaskDelay(200 / portTICK_PERIOD_MS);
+        switchOff = true;
     }else if((now - round1) > 4000){ //4s
         currentSpeed = 0;
         standBy = true;
     }else if(timeInBetween == 0){
         currentSpeed = currentSpeed;
-    }else{
+    }else if(currentTime != 0){
         currentSpeed = wheelCircumference / (timeInBetween / 1000.0); // in m/s
         avgSpeed = distance / (currentTime / 1000.0); // in m/s
     }
 }
 
 void button_task(void *pvParameter) {
-    uint32_t buttonHold = 0;
+    int64_t buttonHold = 0;
     bool rst = false;
     bool buttonPressed = false;
+    bool didReset = false;
     while(1) {
-        if(gpio_get_level(BUTTON_GPIO_NEXT) == 0) {
+        if(gpio_get_level(BUTTON_GPIO_NEXT) == 0){
             if(!rst){
                 currentPage = (currentPage + 1) % 3;
                 switchOff = false;
                 rst = true;
-                standBy = false;
                 pageButtonPressed = xTaskGetTickCount() * portTICK_PERIOD_MS;
                 vTaskDelay(300 / portTICK_PERIOD_MS);
             }else{
                 buttonHold = xTaskGetTickCount() * portTICK_PERIOD_MS;
-                if(buttonHold - pageButtonPressed >= 3000){
-                    reset = true;
-                    standBy = true;
+                if(buttonHold - pageButtonPressed >= 2000){
+                    if(!didReset){
+                        didReset = true;
+                        reset = true;
+                        printf("data reset\n");
+                    }
                 }
             }
         }else{
             rst = false;
+            didReset = false;
         }
 
         if(gpio_get_level(BUTTON_GPIO_WHEEL) == 0) {
@@ -101,13 +104,13 @@ void button_task(void *pvParameter) {
                 roundCount++;
                 round2 = round1;
                 round1 = xTaskGetTickCount() * portTICK_PERIOD_MS;
-                standBy = false;
                 switchOff = false;
+                standBy = false;
             }
         }else{
             buttonPressed = false;
         }
-        vTaskDelay(20 / portTICK_PERIOD_MS);
+        vTaskDelay(42 / portTICK_PERIOD_MS);
     }
 }
 
@@ -182,20 +185,6 @@ void wifi_connection()
     }
 }
 
-esp_err_t client_event_post_handler(esp_http_client_event_handle_t evt)
-{
-    switch (evt->event_id)
-    {
-    case HTTP_EVENT_ON_DATA:
-        printf("HTTP_EVENT_ON_DATA: %.*s\n", evt->data_len, (char *)evt->data);
-        break;
-
-    default:
-        break;
-    }
-    return ESP_OK;
-}
-
 void init_sntp(){
     esp_sntp_setoperatingmode(SNTP_OPMODE_POLL);
     esp_sntp_setservername(0, "pool.ntp.org");
@@ -224,7 +213,7 @@ void send_request() {
     esp_http_client_config_t config = {
         .url = "http://www.stud.fit.vutbr.cz/~xstrei06/IMP/index.php",
         .method = HTTP_METHOD_POST,
-        .event_handler = client_event_post_handler,
+        .event_handler = NULL,
         .cert_pem = NULL,
         .buffer_size = 1024,
     };
@@ -236,7 +225,6 @@ void send_request() {
     }
 
     init_sntp();
-
     char data[128] = {0};
     char *timestamp = getTimestamp();
     sprintf(data, "%s, average speed: %.3f m/s, distance: %.3f m\n", timestamp, avgSpeed, distance);
@@ -264,55 +252,83 @@ void send_request() {
     esp_http_client_cleanup(client);
 }
 
+void nvs_save(nvs_handle_t handle){
+    char save_float[50] = {0};
+    sprintf(save_float, "%f", avgSpeed);
+    nvs_set_str(handle, "avgSpeed", save_float);
+    nvs_set_i32(handle, "roundCount", roundCount);
+    nvs_set_i64(handle, "currentTime", currentTime);
+}
+
+void nvs_load(nvs_handle_t handle){
+    char load_float[50] = {0};
+    size_t length = sizeof(load_float);
+    nvs_get_str(handle, "avgSpeed", load_float, &length);
+    avgSpeed = atof(load_float);
+    nvs_get_i32(handle, "roundCount", &roundCount);
+    nvs_get_i64(handle, "currentTime", &currentTime);
+}
 
 void app_main(void)
 {
-    esp_err_t ret = nvs_flash_init();
-    if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        ret = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(ret);
-
-    wifi_connection();
-
-    vTaskDelay(4000 / portTICK_PERIOD_MS);
-
     spi_master_init(&dev, CONFIG_MOSI_GPIO, CONFIG_SCLK_GPIO, CONFIG_CS_GPIO, CONFIG_DC_GPIO, CONFIG_RESET_GPIO);
 	ssd1306_init(&dev, 128, 64);
+    vTaskDelay(200 / portTICK_PERIOD_MS);
 
-    // init buttons
-    gpio_config_t io_conf;
-    io_conf.intr_type = GPIO_INTR_ANYEDGE;
-    io_conf.pin_bit_mask = (1ULL<<BUTTON_GPIO_NEXT) | (1ULL<<BUTTON_GPIO_WHEEL);
-    io_conf.mode = GPIO_MODE_INPUT;
-    io_conf.pull_up_en = GPIO_PULLUP_ENABLE;
-    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
-    gpio_config(&io_conf);
-
-	ssd1306_clear_screen(&dev, false);
+    ssd1306_clear_screen(&dev, false);
 	ssd1306_contrast(&dev, 0xff);
 	ssd1306_display_text_x3(&dev, 0, "TACHO", 5, false);
     ssd1306_display_text_x3(&dev, 3, "METER", 5, false);
-	vTaskDelay(3000 / portTICK_PERIOD_MS);
+
+    esp_err_t ret = nvs_flash_init();
+    ESP_ERROR_CHECK(ret);
+
+    nvs_handle_t nvs_handle;
+    ret = nvs_open("storage", NVS_READWRITE, &nvs_handle);
+    vTaskDelay(100 / portTICK_PERIOD_MS);
+
+    nvs_load(nvs_handle);
+
+    wifi_connection();
+
+    vTaskDelay(3000 / portTICK_PERIOD_MS);
+
+    // init buttons
+    gpio_config_t io_conf = {
+        .intr_type = GPIO_INTR_DISABLE,
+        .mode = GPIO_MODE_INPUT,
+        .pin_bit_mask = (1ULL << BUTTON_GPIO_NEXT) | (1ULL << BUTTON_GPIO_WHEEL),
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE
+    };
+    gpio_config(&io_conf);
+
+    xTaskCreate(button_task, "button_task", 4096, NULL, 10, NULL);
+
+    vTaskDelay(1000 / portTICK_PERIOD_MS);
+
     ssd1306_clear_screen(&dev, false);
-
-    xTaskCreate(button_task, "button_task", 2048, NULL, 10, NULL);
-
-    send_request();
-    vTaskDelay(500 / portTICK_PERIOD_MS);
 
     while(1) {
         if(reset){
+            reset = false;
             roundCount = 0;
             currentTime = 0;
-            round1 = 0;
-            round2 = 0;
-            distance = 0;
             avgSpeed = 0;
-            currentSpeed = 0;
-            reset = false;
+            distance = 0;
+            display_page();
             send_request();
+            vTaskDelay(300 / portTICK_PERIOD_MS);
+            nvs_save(nvs_handle);
+            vTaskDelay(200 / portTICK_PERIOD_MS);
+        }
+
+        if(switchOff){
+            ssd1306_clear_screen(&dev, false);
+            ssd1306_contrast(&dev, 0xff);
+            while(switchOff){
+                vTaskDelay(100 / portTICK_PERIOD_MS);
+            }
         }
 
         now = xTaskGetTickCount() * portTICK_PERIOD_MS;
@@ -327,14 +343,8 @@ void app_main(void)
 
         display_page();
 
-        if(switchOff){
-            ssd1306_clear_screen(&dev, false);
-            ssd1306_contrast(&dev, 0xff);
-            while(switchOff){
-                vTaskDelay(100 / portTICK_PERIOD_MS);
-            }
-        }
+        nvs_save(nvs_handle);
 
-        vTaskDelay(100 / portTICK_PERIOD_MS);
+        vTaskDelay(50 / portTICK_PERIOD_MS);
     }
 }
