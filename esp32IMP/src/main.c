@@ -31,11 +31,11 @@ SSD1306_t dev;
 
 int currentPage = 0;
 float wheelCircumference = 2.145f; // in meters
-int32_t roundCount = 0; 
+int64_t roundCount = 0; 
 
-float currentSpeed = 0.0f;
-float avgSpeed = 0.0f;
-float distance = 0.0f;
+double currentSpeed = 0.0;
+double avgSpeed = 0.0;
+double distance = 0.0;
 
 int64_t currentTime = 0;
 int64_t now = 0;
@@ -51,7 +51,7 @@ bool switchOff = false;
 void send_request(void);
 
 void calculate_speed_distance() {
-    distance = roundCount * wheelCircumference; // in meters
+    distance = roundCount * wheelCircumference / 1000; // in km
 
     int32_t timeInBetween = round1 - round2; // in ms
 
@@ -66,7 +66,7 @@ void calculate_speed_distance() {
         currentSpeed = currentSpeed;
     }else if(currentTime != 0){
         currentSpeed = wheelCircumference / (timeInBetween / 1000.0); // in m/s
-        avgSpeed = distance / (currentTime / 1000.0); // in m/s
+        avgSpeed = (distance * 1000) / (currentTime / 1000.0); // in m/s
     }
 }
 
@@ -110,33 +110,33 @@ void button_task(void *pvParameter) {
         }else{
             buttonPressed = false;
         }
-        vTaskDelay(42 / portTICK_PERIOD_MS);
+        vTaskDelay(30 / portTICK_PERIOD_MS);
     }
 }
 
 void display_page() {
-    char display_value[16];
+    char display_value[9] = {0};
     switch (currentPage) {
         case 0:
-            ssd1306_contrast(&dev, 0xff);
-            ssd1306_display_text(&dev, 0, "Current speed:", 14, false);
-            sprintf(display_value, " %.3f m/s", currentSpeed);
+            ssd1306_display_text_x2(&dev, 0, "Current ", 8, false);
+            ssd1306_display_text_x2(&dev, 3, "speed:  ", 8, false);
+            sprintf(display_value, "%.2fm/s", currentSpeed);
             break;
         case 1:
-            ssd1306_contrast(&dev, 0xff);
-            ssd1306_display_text(&dev, 0, "Avg. speed:   ", 14, false);
-            sprintf(display_value, " %.3f m/s", avgSpeed);
+            ssd1306_display_text_x2(&dev, 0, "Average ", 8, false);
+            ssd1306_display_text_x2(&dev, 3, "speed:  ", 8, false);
+            sprintf(display_value, "%.2fm/s", avgSpeed);
             break;
         case 2:
-            ssd1306_contrast(&dev, 0xff);
-            ssd1306_display_text(&dev, 0, "Distance:     ", 14, false);
-            sprintf(display_value, " %.3f m", distance);
+            ssd1306_display_text_x2(&dev, 0, "Traveled", 8, false);
+            ssd1306_display_text_x2(&dev, 3, "dist.:  ", 8, false);
+            sprintf(display_value, "%.2fkm", distance);
             break;
     }
-    for(int i = strlen(display_value); i < 16; i++) {
+    for(int i = strlen(display_value); i < 8; i++) {
         display_value[i] = ' ';
     }
-    ssd1306_display_text(&dev, 2, display_value, 16, false);
+    ssd1306_display_text_x2(&dev, 6, display_value, 8, false);
 }
 
 static void wifi_event_handler(void *event_handler_arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
@@ -209,7 +209,17 @@ char* getTimestamp() {
     return timestamp;
 }
 
+bool is_connected() {
+    esp_netif_ip_info_t ip_info;
+    esp_netif_get_ip_info(esp_netif_get_handle_from_ifkey("WIFI_STA_DEF"), &ip_info);
+    return ip_info.ip.addr != 0;
+}
+
 void send_request() {
+    if(!is_connected()) {
+        return;
+    }
+
     esp_http_client_config_t config = {
         .url = "http://www.stud.fit.vutbr.cz/~xstrei06/IMP/index.php",
         .method = HTTP_METHOD_POST,
@@ -227,7 +237,7 @@ void send_request() {
     init_sntp();
     char data[128] = {0};
     char *timestamp = getTimestamp();
-    sprintf(data, "%s, average speed: %.3f m/s, distance: %.3f m\n", timestamp, avgSpeed, distance);
+    sprintf(data, "%s, average speed: %.3f m/s, distance: %.3f km\n", timestamp, avgSpeed, distance);
     free(timestamp);
     esp_sntp_stop();
     
@@ -256,7 +266,7 @@ void nvs_save(nvs_handle_t handle){
     char save_float[50] = {0};
     sprintf(save_float, "%f", avgSpeed);
     nvs_set_str(handle, "avgSpeed", save_float);
-    nvs_set_i32(handle, "roundCount", roundCount);
+    nvs_set_i64(handle, "roundCount", roundCount);
     nvs_set_i64(handle, "currentTime", currentTime);
 }
 
@@ -265,7 +275,7 @@ void nvs_load(nvs_handle_t handle){
     size_t length = sizeof(load_float);
     nvs_get_str(handle, "avgSpeed", load_float, &length);
     avgSpeed = atof(load_float);
-    nvs_get_i32(handle, "roundCount", &roundCount);
+    nvs_get_i64(handle, "roundCount", &roundCount);
     nvs_get_i64(handle, "currentTime", &currentTime);
 }
 
@@ -277,8 +287,8 @@ void app_main(void)
 
     ssd1306_clear_screen(&dev, false);
 	ssd1306_contrast(&dev, 0xff);
-	ssd1306_display_text_x3(&dev, 0, "TACHO", 5, false);
-    ssd1306_display_text_x3(&dev, 3, "METER", 5, false);
+	ssd1306_display_text_x3(&dev, 1, "TACHO", 5, false);
+    ssd1306_display_text_x3(&dev, 4, "METER", 5, false);
 
     esp_err_t ret = nvs_flash_init();
     ESP_ERROR_CHECK(ret);
@@ -318,7 +328,7 @@ void app_main(void)
             distance = 0;
             display_page();
             send_request();
-            vTaskDelay(300 / portTICK_PERIOD_MS);
+            vTaskDelay(200 / portTICK_PERIOD_MS);
             nvs_save(nvs_handle);
             vTaskDelay(200 / portTICK_PERIOD_MS);
         }
@@ -327,7 +337,7 @@ void app_main(void)
             ssd1306_clear_screen(&dev, false);
             ssd1306_contrast(&dev, 0xff);
             while(switchOff){
-                vTaskDelay(100 / portTICK_PERIOD_MS);
+                vTaskDelay(200 / portTICK_PERIOD_MS);
             }
         }
 
